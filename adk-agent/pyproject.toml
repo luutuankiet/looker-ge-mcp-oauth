@@ -1,0 +1,54 @@
+[project]
+name = "looker-ge-agent"
+version = "0.1.0"
+description = "Looker MCP Agent for Gemini Enterprise (per-user OAuth via PKCE proxy)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv==1.0.1",
+    "google-adk==1.27.2",
+    "immutabledict==4.2.1",
+    "google-cloud-aiplatform[adk,agent-engines]>=1.132.0",
+    "absl-py==2.2.2",
+    "pydantic>=2.12.0",
+    "google-auth>=2.47.0",
+    "google-auth-oauthlib==1.2.2",
+    "google-auth-httplib2==0.2.0",
+    "google-genai==1.56.0",
+    "typing-extensions==4.15.0",
+    # Used by set_header_tokens() in agent.py to decode the GCP ID token
+    # so it can cache it until expiry.
+    "pyjwt>=2.8.0",
+]
+
+
+[build-system]
+requires = ["uv_build>=0.7.19,<0.8.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "looker_ge_agent"
+module-root = ""
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[tool.pytest.ini_options]
+# This section is for pytest configuration and does not need to be changed.
+console_output_style = "progress"
+addopts = "-vv -s"
+#addopts = "-vv -s --pdb"
+testpaths = ["tests/"]
+log_level = "DEBUG"
+log_cli = true
+log_auto_indent = true
+log_cli_date_format = "%Y-%m-%d %H:%M:%S"
+log_cli_format = "[%(asctime)s] %(levelname)s (%(funcName)s) \t [%(pathname)s:%(lineno)d] %(message)s"
+filterwarnings = [
+    #"error",
+    "ignore::UserWarning",
+    # note the use of single quote below to denote "raw" strings in TOML
+    #'ignore:function ham\(\) is deprecated:DeprecationWarning',
+]
