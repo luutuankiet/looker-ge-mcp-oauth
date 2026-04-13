@@ -190,22 +190,34 @@ The session-bearing form is what fails with `Session initialization failed.` if 
 
 ## Authorization linkage diagram
 
-```
-GE Engine
-  └── Assistant (default_assistant)
-        └── Agent (looker_mcp_agent)
-              ├── adkAgentDefinition.provisionedReasoningEngine.reasoningEngine
-              │     → projects/<PROJECT_NUMBER>/locations/us-central1/reasoningEngines/<RE_ID>
-              │
-              ├── authorizationConfig.agentAuthorization
-              │     → projects/<PROJECT_NUMBER>/locations/global/authorizations/looker-oauth
-              │
-              └── authorizationConfig.toolAuthorizations[]
-                    → projects/<PROJECT_NUMBER>/locations/global/authorizations/looker-oauth
-                          ├── serverSideOauth2.clientId
-                          ├── serverSideOauth2.clientSecret
-                          ├── serverSideOauth2.authorizationUri  → PKCE proxy /auth
-                          └── serverSideOauth2.tokenUri          → PKCE proxy /token
+```mermaid
+flowchart TB
+    Engine["GE Engine"]
+    Assistant["Assistant<br/>(default_assistant)"]
+    Agent["Agent<br/>(looker_mcp_agent)"]
+
+    RE["adkAgentDefinition.provisionedReasoningEngine.reasoningEngine<br/>→ projects/&lt;PROJECT_NUMBER&gt;/locations/us-central1/reasoningEngines/&lt;RE_ID&gt;"]
+    AgentAuth["authorizationConfig.agentAuthorization"]
+    ToolAuth["authorizationConfig.toolAuthorizations[]"]
+
+    AuthResource["projects/&lt;PROJECT_NUMBER&gt;/locations/global/authorizations/looker-oauth"]
+
+    ClientId["serverSideOauth2.clientId"]
+    ClientSecret["serverSideOauth2.clientSecret"]
+    AuthUri["serverSideOauth2.authorizationUri<br/>→ PKCE proxy /auth"]
+    TokenUri["serverSideOauth2.tokenUri<br/>→ PKCE proxy /token"]
+
+    Engine --> Assistant
+    Assistant --> Agent
+    Agent --> RE
+    Agent --> AgentAuth
+    Agent --> ToolAuth
+    AgentAuth --> AuthResource
+    ToolAuth --> AuthResource
+    AuthResource --> ClientId
+    AuthResource --> ClientSecret
+    AuthResource --> AuthUri
+    AuthResource --> TokenUri
 ```
 
 Both `agentAuthorization` and `toolAuthorizations` typically point at the same authorization resource. The first triggers the OAuth flow when the user opens a chat; the second injects the resulting token into tool call contexts.

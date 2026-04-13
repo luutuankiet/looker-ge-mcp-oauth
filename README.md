@@ -22,31 +22,26 @@ Beyond those three: GE caches OAuth tokens **per user, per authorization resourc
 
 ## Architecture
 
-```
-┌──────────────────┐         ┌─────────────────────────┐         ┌───────────────────┐
-│  Gemini Enterprise│        │  PKCE Proxy (Cloud Func)│        │      Looker       │
-│  (AgentSpace UI) │ ──1──►  │  /auth /callback /token │ ──2──► │  /auth /api/token │
-└────────┬─────────┘         └─────────────────────────┘         └───────────────────┘
-         │                                                                 ▲
-         │ 3. POST streaming_agent_run_with_events                          │
-         │    + session_state[AUTH_ID] = looker_token                       │
-         ▼                                                                 │
-┌──────────────────────────┐                                                │
-│ Vertex AI Agent Engine   │                                                │
-│ (ADK Reasoning Engine)   │                                                │
-│                          │                                                │
-│  set_header_tokens()     │  4. X-Looker-Token: token <looker_token>       │
-│      ↓                   │ ──────────────────────────┐                    │
-│  MCPToolset HTTP call    │                           │                    │
-└──────────────────────────┘                           ▼                    │
-                                          ┌────────────────────┐            │
-                                          │ MCP Toolbox        │            │
-                                          │ (Cloud Run)        │            │
-                                          │ --prebuilt=looker  │ ──5────────┘
-                                          │ LOOKER_USE_CLIENT_ │
-                                          │   OAUTH=X-Looker-  │
-                                          │   Token            │
-                                          └────────────────────┘
+```mermaid
+flowchart LR
+    GE["Gemini Enterprise<br/>(AgentSpace UI)"]
+    Proxy["PKCE Proxy<br/>(Cloud Function)<br/>/auth · /callback · /token"]
+    Looker["Looker<br/>/auth · /api/token"]
+
+    subgraph RE["Vertex AI Agent Engine (ADK Reasoning Engine)"]
+        direction TB
+        SHT["set_header_tokens()"]
+        MCP["MCPToolset HTTP call"]
+        SHT --> MCP
+    end
+
+    Toolbox["MCP Toolbox (Cloud Run)<br/>--prebuilt=looker<br/>LOOKER_USE_CLIENT_OAUTH=X-Looker-Token"]
+
+    GE -- "1" --> Proxy
+    Proxy -- "2" --> Looker
+    GE -- "3. streaming_agent_run_with_events<br/>session_state[AUTH_ID] = looker_token" --> RE
+    MCP -- "4. X-Looker-Token: token &lt;looker_token&gt;" --> Toolbox
+    Toolbox -- "5" --> Looker
 ```
 
 **Flow:**
@@ -55,6 +50,63 @@ Beyond those three: GE caches OAuth tokens **per user, per authorization resourc
 3. GE POSTs the user message to the Reasoning Engine via `streaming_agent_run_with_events`, including the Looker access token in `request.authorizations`. The ADK template injects it into `session.state[AUTH_ID]`.
 4. The agent's `MCPToolset` `header_provider` callback (`set_header_tokens`) reads the token from session state, sets `X-Looker-Token: token <token>` header, and also fetches a GCP ID token for Cloud Run authentication on the toolbox. MCP request goes out.
 5. The MCP Toolbox (with `LOOKER_USE_CLIENT_OAUTH=X-Looker-Token`) reads the token from the `X-Looker-Token` header and passes it as the bearer credential when calling Looker's API. Looker authenticates as the **end user**, returns data scoped to that user's permissions.
+
+---
+
+## Primer: PKCE (if you've only done "traditional" OAuth)
+
+If your mental model of OAuth is "server sends `client_id` + `client_secret` on the token exchange" — that's the **confidential client** flavor. PKCE is the **public client** flavor, and it's why this whole proxy exists.
+
+### Why PKCE exists
+A confidential client (a backend server) can hold a long-lived `client_secret` safely. A public client (SPA, mobile app, CLI, any browser-driven flow) **cannot** — whatever you ship to the browser is visible to the user. So the OAuth spec defines PKCE (RFC 7636) as the replacement for `client_secret` in those environments.
+
+Instead of a pre-shared secret, the client proves continuity across the two HTTP hops (`/auth` then `/token`) using a one-time value it invents on the spot:
+
+```
+code_verifier  = random 43-128 char string            (kept in client memory)
+code_challenge = BASE64URL(SHA256(code_verifier))     (sent on /auth)
+```
+
+| Step | Traditional OAuth | PKCE |
+|---|---|---|
+| `/auth` request | `client_id` | `client_id` + `code_challenge` + `code_challenge_method=S256` |
+| `/token` request | `client_id` + **`client_secret`** + `code` | `client_id` + **`code_verifier`** + `code` |
+| What the IdP verifies | secret matches what's on file | `SHA256(verifier) == challenge` it stored with the code |
+
+The IdP stashes the `code_challenge` next to the authorization code it issued. When the client comes back with the verifier, the server re-hashes it and compares. If they match, the same actor that started `/auth` is the one exchanging at `/token` — no shared secret needed.
+
+### Why Looker's PKCE + Gemini Enterprise don't mix directly
+Looker's `/api/token` is a **strict public client** endpoint: it expects `code_verifier`, and it actively **rejects** any request that contains a `client_secret` field (responds `404 Sinatra::NotFound`, which is confusing as hell to debug).
+
+Gemini Enterprise's `serverSideOauth2` authorization resource is built for **confidential clients**: you must configure a `clientId` + `clientSecret`, and GE always sends the secret on the token exchange. There is no "PKCE-only" mode.
+
+Two incompatible assumptions, one HTTP call in the middle. Neither side can be reconfigured. Hence the proxy.
+
+### What the proxy actually does
+The proxy is a tiny stateless adapter that runs **two different OAuth conversations at once**:
+
+```
+   GE  <—— confidential-client OAuth ——>  Proxy  <—— PKCE public-client OAuth ——>  Looker
+         (client_secret validated)                      (code_verifier/challenge)
+```
+
+- **Leg A (GE ↔ Proxy):** the proxy *pretends* to be a normal confidential OAuth server. It accepts GE's `client_secret` and validates it against `PROXY_CLIENT_SECRET` (this is the proxy's secret, not Looker's — it exists purely to stop random callers from using the proxy).
+- **Leg B (Proxy ↔ Looker):** the proxy is a normal PKCE public client. It generates `code_verifier` + `code_challenge` on `/auth`, and sends the verifier on `/token`. It never forwards a `client_secret` to Looker.
+
+### The stateless trick
+A PKCE proxy usually needs storage: the verifier is created on `/auth` but must be remembered until `/token` arrives. That means Redis or a DB and a TTL policy.
+
+This proxy avoids storage entirely by **smuggling the verifier inside values the OAuth protocol already round-trips for you:**
+
+1. On `/auth`, it packs `(original_state, code_verifier)` into the `state` parameter it sends to Looker (base64-encoded JSON). Looker echoes `state` back unchanged on the callback — that's literally what `state` is for — so the verifier comes home for free.
+2. On `/callback`, it takes the real authorization code from Looker and packs `(real_code, code_verifier)` into a **new wrapped code** that it hands to GE. GE has no idea this is anything other than an opaque auth code and treats it as such.
+3. On `/token`, GE sends the wrapped code back. The proxy unpacks it, recovers `real_code` + `code_verifier`, and does the clean PKCE exchange with Looker.
+
+See `pkce-proxy/main.py:57` (`wrap_code` / `unwrap_code`) — it's ~15 lines of base64url(JSON). No database, no TTL, no state.
+
+One subtlety: GE *also* runs its own PKCE on leg A (it sends `code_challenge` to `/auth` and `code_verifier` on `/token`). The proxy simply ignores GE's PKCE params on leg A. GE's confidential-client `client_secret` check is what we actually validate; its PKCE is ornamental from our perspective, and engaging with it would only add moving parts.
+
+> **Visual walkthrough:** there's an interactive step-by-step version of this flow (sequence diagram + data shapes at each hop + traditional-vs-PKCE diff) published as an artifact — see the link at the bottom of this section after running through the primer.
 
 ---
 
